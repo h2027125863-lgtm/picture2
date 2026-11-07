@@ -1,0 +1,556 @@
+
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport"
+      content="width=device-width,initial-scale=1.0">
+
+<title>透明羽化扇形转场</title>
+
+<style>
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  width: 100%;
+  min-height: 100%;
+  background: transparent !important;
+  overflow-x: hidden;
+}
+
+body {
+  display: grid;
+  place-items: center;
+}
+
+#stage {
+  position: relative;
+  width: min(100%, 1100px);
+  aspect-ratio: 4 / 3;
+  overflow: hidden;
+  background: transparent !important;
+  cursor: pointer;
+  touch-action: pan-y;
+  -webkit-tap-highlight-color: transparent;
+}
+
+#frame {
+  display: block;
+  width: 100%;
+  height: 100%;
+  background: transparent !important;
+  pointer-events: none;
+}
+
+#stage:focus-visible {
+  outline: 1px solid rgba(255,255,255,.22);
+  outline-offset: -4px;
+}
+</style>
+</head>
+
+<body>
+
+<div id="stage" tabindex="0" role="button">
+  <canvas id="frame"></canvas>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // 三张原始图片
+  const SOURCES = [
+    "image-1.webp",
+    "image-2.webp",
+    "image-3.webp"
+  ];
+
+  // ===== 动画参数（毫秒） =====
+  const FADE_IN = 1000;
+  const HOLD = 2000;
+  const FAN = 1350;
+
+  const MAX_TIME =
+    FADE_IN + HOLD + FAN + HOLD + FAN;
+
+  // 四周羽化宽度
+  const FEATHER_X = 0.082;
+  const FEATHER_Y = 0.105;
+
+  // 扇形交界处羽化程度
+  const FAN_EDGE = 0.048;
+
+  const stage = document.getElementById("stage");
+  const canvas = document.getElementById("frame");
+
+  const ctx = canvas.getContext("2d", {
+    alpha: true
+  });
+
+  const imageEls = SOURCES.map(src => {
+    const im = new Image();
+    im.src = src;
+    return im;
+  });
+
+  let imagesReady = false;
+  let layers = [];
+
+  let work;
+  let workCtx;
+  let mask;
+  let maskCtx;
+
+  let width = 0;
+  let height = 0;
+
+  let animationId = null;
+  let startTime = null;
+
+  let running = false;
+  let completed = false;
+  let wasMouseInside = false;
+
+  // 平滑缓动
+  function ease(t) {
+    t = Math.max(0, Math.min(1, t));
+    return t * t * (3 - 2 * t);
+  }
+
+  function createCanvas(w, h) {
+    const c = document.createElement("canvas");
+    c.width = w;
+    c.height = h;
+    return c;
+  }
+
+  // =================================
+  // 图片四周透明羽化
+  // =================================
+  function makeFeatheredImage(im) {
+    const c = createCanvas(width, height);
+    const g = c.getContext("2d");
+
+    const aspect =
+      im.naturalWidth / im.naturalHeight;
+
+    const boxAspect = width / height;
+
+    let dw, dh;
+
+    if (aspect > boxAspect) {
+      dw = width;
+      dh = width / aspect;
+    } else {
+      dh = height;
+      dw = height * aspect;
+    }
+
+    g.drawImage(
+      im,
+      (width - dw) / 2,
+      (height - dh) / 2,
+      dw,
+      dh
+    );
+
+    g.globalCompositeOperation = "destination-in";
+
+    const fx = width * FEATHER_X;
+    const fy = height * FEATHER_Y;
+
+    // 左右羽化
+    const gradX =
+      g.createLinearGradient(0, 0, width, 0);
+
+    gradX.addColorStop(
+      0, "rgba(255,255,255,0)"
+    );
+
+    gradX.addColorStop(
+      fx / width, "rgba(255,255,255,1)"
+    );
+
+    gradX.addColorStop(
+      1 - fx / width, "rgba(255,255,255,1)"
+    );
+
+    gradX.addColorStop(
+      1, "rgba(255,255,255,0)"
+    );
+
+    g.fillStyle = gradX;
+    g.fillRect(0, 0, width, height);
+
+    // 上下羽化
+    const gradY =
+      g.createLinearGradient(0, 0, 0, height);
+
+    gradY.addColorStop(
+      0, "rgba(255,255,255,0)"
+    );
+
+    gradY.addColorStop(
+      fy / height, "rgba(255,255,255,1)"
+    );
+
+    gradY.addColorStop(
+      1 - fy / height, "rgba(255,255,255,1)"
+    );
+
+    gradY.addColorStop(
+      1, "rgba(255,255,255,0)"
+    );
+
+    g.fillStyle = gradY;
+    g.fillRect(0, 0, width, height);
+
+    g.globalCompositeOperation = "source-over";
+
+    return c;
+  }
+
+  // =================================
+  // 构建透明画布
+  // =================================
+  function rebuild() {
+    if (!imagesReady) return;
+
+    const rect = stage.getBoundingClientRect();
+
+    if (!rect.width || !rect.height) return;
+
+    const ratio = Math.min(
+      window.devicePixelRatio || 1,
+      1.7
+    );
+
+    width = canvas.width =
+      Math.round(rect.width * ratio);
+
+    height = canvas.height =
+      Math.round(rect.height * ratio);
+
+    layers = imageEls.map(makeFeatheredImage);
+
+    work = createCanvas(width, height);
+    workCtx = work.getContext("2d");
+
+    mask = createCanvas(width, height);
+    maskCtx = mask.getContext("2d");
+  }
+
+  // =================================
+  // 原版扇形淡入淡出算法
+  // 不改变弧度与转场方向
+  // =================================
+  function drawFanLayer(index, progress, incoming) {
+
+    const p = ease(progress);
+
+    const band = Math.max(
+      12,
+      width * FAN_EDGE
+    );
+
+    const step = Math.max(
+      2,
+      Math.round(height / 180)
+    );
+
+    maskCtx.clearRect(0, 0, width, height);
+
+    for (let y = 0; y < height; y += step) {
+
+      const norm =
+        ((y + step / 2) / height - .5) * 2;
+
+      // 扇形弧度
+      const arc =
+        width * .19 *
+        Math.sin(Math.PI * p) *
+        Math.sqrt(Math.max(0, 1 - norm * norm));
+
+      // 轻微倾斜
+      const tilt =
+        width * .055 *
+        Math.sin(Math.PI * p) *
+        norm;
+
+      // 从右向左移动的扇形边界
+      const edgeX =
+        width * (1 - p) + arc + tilt;
+
+      const grad =
+        maskCtx.createLinearGradient(
+          edgeX - band,
+          0,
+          edgeX + band,
+          0
+        );
+
+      if (incoming) {
+
+        // 新图片从右侧淡入
+        grad.addColorStop(
+          0, "rgba(255,255,255,0)"
+        );
+
+        grad.addColorStop(
+          1, "rgba(255,255,255,1)"
+        );
+
+      } else {
+
+        // 旧图片向左侧淡出
+        grad.addColorStop(
+          0, "rgba(255,255,255,1)"
+        );
+
+        grad.addColorStop(
+          1, "rgba(255,255,255,0)"
+        );
+      }
+
+      maskCtx.fillStyle = grad;
+
+      maskCtx.fillRect(
+        0,
+        y,
+        width,
+        Math.min(step, height - y)
+      );
+    }
+
+    workCtx.clearRect(0, 0, width, height);
+
+    workCtx.globalCompositeOperation =
+      "source-over";
+
+    workCtx.drawImage(layers[index], 0, 0);
+
+    workCtx.globalCompositeOperation =
+      "destination-in";
+
+    workCtx.drawImage(mask, 0, 0);
+
+    workCtx.globalCompositeOperation =
+      "source-over";
+
+    ctx.drawImage(work, 0, 0);
+  }
+
+  // =================================
+  // 按时间轴绘制每一帧
+  // =================================
+  function render(timeMs) {
+
+    if (!imagesReady || !layers.length) return;
+
+    ctx.clearRect(0, 0, width, height);
+
+    const t = Math.max(0, timeMs);
+
+    const t1 = FADE_IN;
+    const t2 = t1 + HOLD;
+    const t3 = t2 + FAN;
+    const t4 = t3 + HOLD;
+    const t5 = t4 + FAN;
+
+    if (t < t1) {
+
+      // 第一张图片淡入
+      ctx.globalAlpha = ease(t / FADE_IN);
+
+      ctx.drawImage(layers[0], 0, 0);
+
+    } else if (t < t2) {
+
+      // 第一张停留2秒
+      ctx.drawImage(layers[0], 0, 0);
+
+    } else if (t < t3) {
+
+      // 第一张向左扇形淡出
+      // 第二张同时从右侧扇形淡入
+      const p = (t - t2) / FAN;
+
+      drawFanLayer(0, p, false);
+      drawFanLayer(1, p, true);
+
+    } else if (t < t4) {
+
+      // 第二张停留2秒
+      ctx.drawImage(layers[1], 0, 0);
+
+    } else if (t < t5) {
+
+      // 第二张向左扇形淡出
+      // 第三张同时从右侧扇形淡入
+      const p = (t - t4) / FAN;
+
+      drawFanLayer(1, p, false);
+      drawFanLayer(2, p, true);
+
+    } else {
+
+      // 最后保留第三张
+      ctx.drawImage(layers[2], 0, 0);
+    }
+
+    ctx.globalAlpha = 1;
+  }
+
+  // =================================
+  // 动画循环
+  // =================================
+  function frame(now) {
+
+    if (startTime === null) {
+      startTime = now;
+    }
+
+    const t = Math.min(
+      MAX_TIME,
+      now - startTime
+    );
+
+    render(t);
+
+    if (t >= MAX_TIME) {
+      running = false;
+      completed = true;
+      animationId = null;
+      return;
+    }
+
+    animationId =
+      requestAnimationFrame(frame);
+  }
+
+  // =================================
+  // 启动 / 重新播放
+  // =================================
+  function start() {
+
+    if (!imagesReady) return;
+
+    if (animationId !== null) {
+      cancelAnimationFrame(animationId);
+    }
+
+    running = true;
+    completed = false;
+    startTime = null;
+
+    render(0);
+
+    animationId =
+      requestAnimationFrame(frame);
+  }
+
+  // 鼠标进入触发
+  stage.addEventListener("pointerenter", e => {
+
+    if (
+      e.pointerType === "mouse" ||
+      e.pointerType === "pen"
+    ) {
+
+      if (!wasMouseInside && !running) {
+        start();
+      }
+
+      wasMouseInside = true;
+    }
+  });
+
+  // 鼠标离开
+  stage.addEventListener("pointerleave", () => {
+    wasMouseInside = false;
+  });
+
+  // 点击或手指触摸
+  stage.addEventListener("pointerdown", start);
+
+  // 键盘触发
+  stage.addEventListener("keydown", e => {
+
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      start();
+    }
+  });
+
+  // =================================
+  // 窗口大小变化
+  // =================================
+  window.addEventListener("resize", () => {
+
+    if (!imagesReady) return;
+
+    const oldTime =
+      (running && startTime !== null)
+        ? performance.now() - startTime
+        : null;
+
+    if (animationId !== null) {
+      cancelAnimationFrame(animationId);
+    }
+
+    rebuild();
+
+    if (oldTime !== null) {
+
+      render(oldTime);
+
+      startTime =
+        performance.now() - oldTime;
+
+      animationId =
+        requestAnimationFrame(frame);
+
+    } else if (completed) {
+
+      render(MAX_TIME);
+
+    } else {
+
+      ctx.clearRect(0, 0, width, height);
+    }
+  });
+
+  // 外部网页可调用
+  window.playFeatherGallery = start;
+
+  // 预览指定时间帧
+  window.previewFeatherFrame =
+    timeMs => render(timeMs);
+
+  // =================================
+  // 加载图片
+  // =================================
+  Promise.all(
+    imageEls.map(im => im.decode())
+  ).then(() => {
+
+    imagesReady = true;
+
+    rebuild();
+
+    // 初始保持透明
+    ctx.clearRect(0, 0, width, height);
+
+  }).catch(err => {
+    console.error("图片加载失败:", err);
+  });
+
+})();
+</script>
+</body>
+</html>
